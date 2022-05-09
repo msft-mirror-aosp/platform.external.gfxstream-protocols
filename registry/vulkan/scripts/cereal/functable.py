@@ -98,7 +98,9 @@ class VulkanFuncTable(VulkanWrapperGenerator):
         self.cgen = CodeGen()
         self.entries = []
         self.entryFeatures = []
+        self.cmdToFeatureType = {}
         self.feature = None
+        self.featureType = None
 
     def onBegin(self,):
         cgen = self.cgen
@@ -110,8 +112,16 @@ class VulkanFuncTable(VulkanWrapperGenerator):
         self.module.appendImpl(cgen.swapCode())
         pass
 
-    def onBeginFeature(self, featureName):
+    def onBeginFeature(self, featureName, featureType):
         self.feature = featureName
+        self.featureType = featureType
+
+    def onEndFeature(self):
+        self.feature = None
+        self.featureType = None
+
+    def onFeatureNewCmd(self, name):
+        self.cmdToFeatureType[name] = self.featureType
 
     def onGenCmd(self, cmdinfo, name, alias):
         typeInfo = self.typeInfo
@@ -167,11 +177,15 @@ class VulkanFuncTable(VulkanWrapperGenerator):
             cgen.beginBlock()
             if self.feature == "VK_VERSION_1_1":
                 cgen.stmt("auto resources = ResourceTracker::get()")
+                if "VkCommandBuffer" == api.parameters[0].typeName:
+                    cgen.stmt("VkDevice device = resources->getDevice(commandBuffer)")
                 cgen.beginIf("resources->getApiVersionFromDevice(device) < VK_API_VERSION_1_1")
                 cgen.stmt("sOnInvalidDynamicallyCheckedCall(\"%s\", \"%s\")" % (api.name, self.feature))
                 cgen.endIf()
             elif self.feature != "VK_VERSION_1_0":
                 cgen.stmt("auto resources = ResourceTracker::get()")
+                if "VkCommandBuffer" == api.parameters[0].typeName:
+                    cgen.stmt("VkDevice device = resources->getDevice(commandBuffer);")
                 cgen.beginIf("!resources->hasDeviceExtension(device, \"%s\")" % self.feature)
                 cgen.stmt("sOnInvalidDynamicallyCheckedCall(\"%s\", \"%s\")" % (api.name, self.feature))
                 cgen.endIf()
@@ -321,4 +335,8 @@ class VulkanFuncTable(VulkanWrapperGenerator):
         self.module.appendImpl(self.cgen.swapCode())
 
     def isDeviceDispatch(self, api):
-        return len(api.parameters) > 0 and "VkDevice" == api.parameters[0].typeName
+        # TODO(230793667): improve the heuristic and just use "cmdToFeatureType"
+        return (len(api.parameters) > 0 and
+            "VkDevice" == api.parameters[0].typeName) or (
+            "VkCommandBuffer" == api.parameters[0].typeName and
+            self.cmdToFeatureType.get(api.name, "") == "device")
