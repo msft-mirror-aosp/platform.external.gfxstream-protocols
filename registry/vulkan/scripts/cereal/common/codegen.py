@@ -16,6 +16,7 @@
 from .vulkantypes import VulkanType, VulkanTypeInfo, VulkanCompoundType, VulkanAPI
 from collections import OrderedDict
 from copy import copy
+from pathlib import Path, PurePosixPath
 
 import os
 import sys
@@ -53,10 +54,10 @@ class Module(object):
     def getCMakeSrcEntry(self):
         if self.customAbsDir:
             return "\n" + self.basename + ".cpp "
-        dirName = self.directory
-        baseName = self.basename
-        joined = os.path.join(dirName, baseName)
-        return "\n    " + joined + ".cpp "
+        dirName = Path(self.directory)
+        baseName = Path(self.basename)
+        joined = PurePosixPath(dirName / baseName)
+        return "\n    " + str(joined) + ".cpp "
 
     def begin(self, globalDir):
         if self.suppress:
@@ -577,7 +578,7 @@ class CodeGen(object):
     def generalLengthAccessGuard(self, vulkanType, parentVarName="parent"):
         return self.makeLengthAccess(vulkanType, parentVarName)[1]
 
-    def vkApiCall(self, api, customPrefix="", customParameters=None, retVarDecl=True, retVarAssign=True):
+    def vkApiCall(self, api, customPrefix="", globalStatePrefix="", customParameters=None, checkForDeviceLost=False):
         callLhs = None
 
         retTypeName = api.getRetTypeExpr()
@@ -585,10 +586,8 @@ class CodeGen(object):
 
         if retTypeName != "void":
             retVar = api.getRetVarExpr()
-            if retVarDecl:
-                self.stmt("%s %s = (%s)0" % (retTypeName, retVar, retTypeName))
-            if retVarAssign:
-                callLhs = retVar
+            self.stmt("%s %s = (%s)0" % (retTypeName, retVar, retTypeName))
+            callLhs = retVar
 
         if customParameters is None:
             self.funcCall(
@@ -596,6 +595,9 @@ class CodeGen(object):
         else:
             self.funcCall(
                 callLhs, customPrefix + api.name, customParameters)
+
+        if retTypeName == "VkResult" and checkForDeviceLost:
+            self.stmt("if ((%s) == VK_ERROR_DEVICE_LOST) %sDeviceLost()" % (callLhs, globalStatePrefix))
 
         return (retTypeName, retVar)
 
@@ -844,9 +846,9 @@ class VulkanAPIWrapper(object):
 # VulkanAPIWrapper objects to make it easier to generate the code.
 class VulkanWrapperGenerator(object):
 
-    def __init__(self, module, typeInfo):
-        self.module = module
-        self.typeInfo = typeInfo
+    def __init__(self, module: Module, typeInfo: VulkanTypeInfo):
+        self.module: Module = module
+        self.typeInfo: VulkanTypeInfo = typeInfo
         self.extensionStructTypes = OrderedDict()
 
     def onBegin(self):

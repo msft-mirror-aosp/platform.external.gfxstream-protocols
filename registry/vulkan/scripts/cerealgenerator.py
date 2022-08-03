@@ -17,6 +17,7 @@
 
 import os, re, sys
 from generator import *
+from pathlib import Path, PurePosixPath
 
 import cereal
 from cereal.wrapperdefs import VULKAN_STREAM_TYPE
@@ -24,6 +25,7 @@ from cereal.wrapperdefs import VULKAN_STREAM_TYPE_GUEST
 
 # CerealGenerator - generates set of driver sources
 # while being agnostic to the stream implementation
+from reg import GroupInfo, TypeInfo, EnumInfo
 
 copyrightHeader = """// Copyright (C) 2018 The Android Open Source Project
 // Copyright (C) 2018 Google Inc.
@@ -71,12 +73,12 @@ def banner_command(argv):
        Return a string corresponding to the command, with platform-specific
        paths removed."""
 
-    def makeRelative(someArg):
+    def makePosixRelative(someArg):
         if os.path.exists(someArg):
-            return os.path.relpath(someArg)
+            return str(PurePosixPath(Path(os.path.relpath(someArg))))
         return someArg
 
-    return ' '.join(map(makeRelative, argv))
+    return ' '.join(map(makePosixRelative, argv))
 
 suppressEnabled = False
 suppressExceptModule = None
@@ -119,7 +121,7 @@ class CerealGenerator(OutputGenerator):
 
         init_suppress_option()
 
-        self.typeInfo = cereal.VulkanTypeInfo()
+        self.typeInfo = cereal.VulkanTypeInfo(self)
 
         self.modules = {}
         self.protos = {}
@@ -344,6 +346,7 @@ using DlSymFunc = void* (void*, const char*);
 
         decoderSnapshotHeaderIncludes = """
 #include <memory>
+#include "base/GfxApiLogger.h"
 #include "common/goldfish_vk_private_defs.h"
 """
         decoderSnapshotImplIncludes = f"""
@@ -355,6 +358,8 @@ using DlSymFunc = void* (void*, const char*);
 """
 
         decoderHeaderIncludes = """
+#include "base/GfxApiLogger.h"
+
 #include <memory>
 
 namespace android {
@@ -485,6 +490,12 @@ class BumpPool;
                            extraImpl="",
                            useNamespace=False,
                            implOnly=True)
+        self.addHostModule("ApiLogDecoder",
+                           extraHeader="",
+                           extraImpl="",
+                           useNamespace=False,
+                           implOnly=True,
+                           suppress=True)
 
         self.addWrapper(cereal.VulkanEncoder, "VkEncoder")
         self.addWrapper(cereal.VulkanExtensionStructs, "goldfish_vk_extension_structs_guest")
@@ -506,6 +517,7 @@ class BumpPool;
         self.addWrapper(cereal.VulkanDecoder, "VkDecoder")
         self.addWrapper(cereal.VulkanDecoderSnapshot, "VkDecoderSnapshot")
         self.addWrapper(cereal.VulkanSubDecoder, "VkSubDecoder")
+        self.addWrapper(cereal.ApiLogDecoder, "ApiLogDecoder")
 
         self.guestAndroidMkCppFiles = ""
         self.hostCMakeCppFiles = ""
@@ -524,6 +536,9 @@ class BumpPool;
         self.forEachModule(addSrcEntry)
 
     def addGuestEncoderModule(self, basename, extraHeader = "", extraImpl = "", useNamespace = True):
+        if not os.path.exists(self.guest_abs_encoder_destination):
+            print("Path [%s] not found (guest encoder path), skipping" % self.guest_abs_encoder_destination)
+            return
         self.addModule(self.guest_encoder_tag,
                        basename,
                        extraHeader = extraHeader,
@@ -532,6 +547,9 @@ class BumpPool;
                        useNamespace = useNamespace)
 
     def addGuestHalModule(self, basename, extraHeader = "", extraImpl = "", useNamespace = True):
+        if not os.path.exists(self.guest_abs_hal_destination):
+            print("Path [%s] not found (guest encoder path), skipping" % self.guest_abs_encoder_destination)
+            return
         self.addModule(self.guest_hal_tag,
                        basename,
                        extraHeader = extraHeader,
@@ -539,23 +557,29 @@ class BumpPool;
                        customAbsDir = self.guest_abs_hal_destination,
                        useNamespace = useNamespace)
 
-    def addHostModule(self, basename, extraHeader = "", extraImpl = "", useNamespace = True, implOnly = False):
+    def addHostModule(self, basename, extraHeader = "", extraImpl = "", useNamespace = True,
+                      implOnly = False, suppress = False):
+        if not os.path.exists(self.host_abs_decoder_destination):
+            print("Path [%s] not found (guest encoder path), skipping" % self.guest_abs_encoder_destination)
+            return
         self.addModule(self.host_tag,
                        basename,
                        extraHeader = extraHeader,
                        extraImpl = extraImpl,
                        customAbsDir = self.host_abs_decoder_destination,
                        useNamespace = useNamespace,
-                       implOnly = implOnly)
+                       implOnly = implOnly,
+                       suppress = suppress)
 
     def addModule(self, directory, basename,
                   extraHeader = "", extraImpl = "",
                   customAbsDir = None,
                   useNamespace = True,
-                  implOnly = False):
+                  implOnly = False,
+                  suppress = False):
         self.moduleList.append(basename)
         self.modules[basename] = \
-            cereal.Module(directory, basename, customAbsDir = customAbsDir, implOnly = implOnly)
+            cereal.Module(directory, basename, customAbsDir = customAbsDir, suppress = suppress, implOnly = implOnly)
         self.modules[basename].headerPreamble = copyrightHeader
         self.modules[basename].headerPreamble += \
                 autogeneratedHeaderTemplate % \
@@ -598,8 +622,11 @@ class BumpPool;
 """ % namespaceEnd
 
     def addWrapper(self, moduleType, moduleName, **kwargs):
-        self.wrappers.append( \
-            moduleType( \
+        if moduleName not in self.modules:
+            print(f'Unknown module: {moduleName}. All known modules are: {", ".join(self.modules)}.')
+            return
+        self.wrappers.append(
+            moduleType(
                 self.modules[moduleName],
                 self.typeInfo, **kwargs))
 
@@ -618,7 +645,7 @@ class BumpPool;
 
         if suppressEnabled:
             def enableSuppression(m):
-                m.suppress = True;
+                m.suppress = True
             self.forEachModule(enableSuppression)
             self.modules[suppressExceptModule].suppress = False
 
@@ -666,7 +693,7 @@ class BumpPool;
         self.forEachModule(lambda m: m.appendImpl("#endif\n"))
         self.forEachWrapper(lambda w: w.onEndFeature())
 
-    def genType(self, typeinfo, name, alias):
+    def genType(self, typeinfo: TypeInfo, name, alias):
         OutputGenerator.genType(self, typeinfo, name, alias)
         self.typeInfo.onGenType(typeinfo, name, alias)
         self.forEachWrapper(lambda w: w.onGenType(typeinfo, name, alias))
@@ -676,12 +703,12 @@ class BumpPool;
         self.typeInfo.onGenStruct(typeinfo, typeName, alias)
         self.forEachWrapper(lambda w: w.onGenStruct(typeinfo, typeName, alias))
 
-    def genGroup(self, groupinfo, groupName, alias = None):
+    def genGroup(self, groupinfo: GroupInfo, groupName, alias = None):
         OutputGenerator.genGroup(self, groupinfo, groupName, alias)
         self.typeInfo.onGenGroup(groupinfo, groupName, alias)
         self.forEachWrapper(lambda w: w.onGenGroup(groupinfo, groupName, alias))
 
-    def genEnum(self, enuminfo, name, alias):
+    def genEnum(self, enuminfo: EnumInfo, name, alias):
         OutputGenerator.genEnum(self, enuminfo, name, alias)
         self.typeInfo.onGenEnum(enuminfo, name, alias)
         self.forEachWrapper(lambda w: w.onGenEnum(enuminfo, name, alias))
