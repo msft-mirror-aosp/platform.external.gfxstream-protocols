@@ -642,6 +642,9 @@ custom_decodes = {
     "vkCreateFramebuffer" : emit_global_state_wrapped_decoding,
     "vkDestroyFramebuffer" : emit_global_state_wrapped_decoding,
 
+    "vkCreateSamplerYcbcrConversion": emit_global_state_wrapped_decoding,
+    "vkDestroySamplerYcbcrConversion": emit_global_state_wrapped_decoding,
+
     # VK_ANDROID_native_buffer
     "vkGetSwapchainGrallocUsageANDROID" : emit_global_state_wrapped_decoding,
     "vkGetSwapchainGrallocUsage2ANDROID" : emit_global_state_wrapped_decoding,
@@ -699,6 +702,10 @@ custom_decodes = {
 
     # VK_EXT_metal_surface
     "vkCreateMetalSurfaceEXT": decode_unsupported_api,
+
+    # VK_KHR_sampler_ycbcr_conversion
+    "vkCreateSamplerYcbcrConversionKHR": emit_global_state_wrapped_decoding,
+    "vkDestroySamplerYcbcrConversionKHR": emit_global_state_wrapped_decoding,
 }
 
 class VulkanDecoder(VulkanWrapperGenerator):
@@ -744,7 +751,13 @@ class VulkanDecoder(VulkanWrapperGenerator):
         if (queueSubmitWithCommandsEnabled && ((opcode >= OP_vkFirst && opcode < OP_vkLast) || (opcode >= OP_vkFirst_old && opcode < OP_vkLast_old))) {
             uint32_t seqno; memcpy(&seqno, *readStreamPtrPtr, sizeof(uint32_t)); *readStreamPtrPtr += sizeof(uint32_t);
             if (seqnoPtr && !m_forSnapshotLoad) {
-                while ((seqno - __atomic_load_n(seqnoPtr, __ATOMIC_SEQ_CST) != 1));
+                while ((seqno - __atomic_load_n(seqnoPtr, __ATOMIC_SEQ_CST) != 1)) {
+                #if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))
+                _mm_pause();
+                #elif (defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)))
+                __asm__ __volatile__("pause;");
+                #endif
+                }
             }
         }
         """)
