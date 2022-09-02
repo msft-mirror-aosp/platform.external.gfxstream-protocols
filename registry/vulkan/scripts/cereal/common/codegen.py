@@ -16,14 +16,17 @@
 from .vulkantypes import VulkanType, VulkanTypeInfo, VulkanCompoundType, VulkanAPI
 from collections import OrderedDict
 from copy import copy
+from pathlib import Path, PurePosixPath
 
 import os
 import sys
+import shutil
+import subprocess
 
 # Class capturing a .cpp file and a .h file (a "C++ module")
 class Module(object):
 
-    def __init__(self, directory, basename, customAbsDir = None, suppress = False, implOnly = False):
+    def __init__(self, directory, basename, customAbsDir = None, suppress = False, implOnly = False, headerOnly = False, suppressFeatureGuards = False):
         self.directory = directory
         self.basename = basename
 
@@ -41,6 +44,9 @@ class Module(object):
         self.suppress = suppress
 
         self.implOnly = implOnly
+        self.headerOnly = headerOnly
+
+        self.suppressFeatureGuards = suppressFeatureGuards
 
     def getMakefileSrcEntry(self):
         if self.customAbsDir:
@@ -53,10 +59,10 @@ class Module(object):
     def getCMakeSrcEntry(self):
         if self.customAbsDir:
             return "\n" + self.basename + ".cpp "
-        dirName = self.directory
-        baseName = self.basename
-        joined = os.path.join(dirName, baseName)
-        return "\n    " + joined + ".cpp "
+        dirName = Path(self.directory)
+        baseName = Path(self.basename)
+        joined = PurePosixPath(dirName / baseName)
+        return "\n    " + str(joined) + ".cpp "
 
     def begin(self, globalDir):
         if self.suppress:
@@ -71,11 +77,13 @@ class Module(object):
         filename = os.path.join(absDir, self.basename)
 
         fpHeader = None
+        fpImpl = None
 
         if not self.implOnly:
             fpHeader = open(filename + ".h", "w", encoding="utf-8")
 
-        fpImpl = open(filename + ".cpp", "w", encoding="utf-8")
+        if not self.headerOnly:
+            fpImpl = open(filename + ".cpp", "w", encoding="utf-8")
 
         self.headerFileHandle = fpHeader
         self.implFileHandle = fpImpl
@@ -83,7 +91,8 @@ class Module(object):
         if not self.implOnly:
             self.headerFileHandle.write(self.headerPreamble)
 
-        self.implFileHandle.write(self.implPreamble)
+        if not self.headerOnly:
+            self.implFileHandle.write(self.implPreamble)
 
     def appendHeader(self, toAppend):
         if self.suppress:
@@ -96,21 +105,29 @@ class Module(object):
         if self.suppress:
             return
 
-        self.implFileHandle.write(toAppend)
+        if not self.headerOnly:
+            self.implFileHandle.write(toAppend)
 
     def end(self):
         if self.suppress:
             return
 
+        clang_format_command = shutil.which('clang-format')
+        assert (clang_format_command is not None)
+
+        def formatFile(filename: str):
+            assert (subprocess.call([clang_format_command, "-i", "--style=file", filename]) == 0)
+
         if not self.implOnly:
             self.headerFileHandle.write(self.headerPostamble)
-
-        self.implFileHandle.write(self.implPostamble)
-
-        if not self.implOnly:
             self.headerFileHandle.close()
+            formatFile(self.headerFileHandle.name)
 
-        self.implFileHandle.close()
+        if not self.headerOnly:
+            self.implFileHandle.write(self.implPostamble)
+            self.implFileHandle.close()
+            formatFile(self.implFileHandle.name)
+
 
 # Class capturing a .proto protobuf definition file
 class Proto(object):
@@ -472,7 +489,7 @@ class CodeGen(object):
 
         deref = "->" if asPtr else "."
         lenAccessGuardExpr = "%s" % (
-            
+
             structVarName) if deref else None
         if lenExpr == "null-terminated":
             return "strlen(%s%s%s)" % (structVarName, deref,
@@ -577,7 +594,7 @@ class CodeGen(object):
     def generalLengthAccessGuard(self, vulkanType, parentVarName="parent"):
         return self.makeLengthAccess(vulkanType, parentVarName)[1]
 
-    def vkApiCall(self, api, customPrefix="", customParameters=None, retVarDecl=True):
+    def vkApiCall(self, api, customPrefix="", globalStatePrefix="", customParameters=None, checkForDeviceLost=False):
         callLhs = None
 
         retTypeName = api.getRetTypeExpr()
@@ -585,8 +602,7 @@ class CodeGen(object):
 
         if retTypeName != "void":
             retVar = api.getRetVarExpr()
-            if retVarDecl:
-                self.stmt("%s %s = (%s)0" % (retTypeName, retVar, retTypeName))
+            self.stmt("%s %s = (%s)0" % (retTypeName, retVar, retTypeName))
             callLhs = retVar
 
         if customParameters is None:
@@ -595,6 +611,9 @@ class CodeGen(object):
         else:
             self.funcCall(
                 callLhs, customPrefix + api.name, customParameters)
+
+        if retTypeName == "VkResult" and checkForDeviceLost:
+            self.stmt("if ((%s) == VK_ERROR_DEVICE_LOST) %sDeviceLost()" % (callLhs, globalStatePrefix))
 
         return (retTypeName, retVar)
 
@@ -843,9 +862,9 @@ class VulkanAPIWrapper(object):
 # VulkanAPIWrapper objects to make it easier to generate the code.
 class VulkanWrapperGenerator(object):
 
-    def __init__(self, module, typeInfo):
-        self.module = module
-        self.typeInfo = typeInfo
+    def __init__(self, module: Module, typeInfo: VulkanTypeInfo):
+        self.module: Module = module
+        self.typeInfo: VulkanTypeInfo = typeInfo
         self.extensionStructTypes = OrderedDict()
 
     def onBegin(self):
@@ -854,7 +873,10 @@ class VulkanWrapperGenerator(object):
     def onEnd(self):
         pass
 
-    def onBeginFeature(self, featureName):
+    def onBeginFeature(self, featureName, featureType):
+        pass
+
+    def onFeatureNewCmd(self, cmdName):
         pass
 
     def onEndFeature(self):

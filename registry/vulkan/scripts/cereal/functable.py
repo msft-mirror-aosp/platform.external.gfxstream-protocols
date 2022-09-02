@@ -70,6 +70,8 @@ RESOURCE_TRACKER_ENTRIES = [
     "vkDestroyDescriptorSetLayout",
     "vkAllocateCommandBuffers",
     "vkQueueSignalReleaseImageANDROID",
+    "vkCmdPipelineBarrier",
+    "vkCreateGraphicsPipelines",
 ]
 
 SUCCESS_VAL = {
@@ -98,7 +100,9 @@ class VulkanFuncTable(VulkanWrapperGenerator):
         self.cgen = CodeGen()
         self.entries = []
         self.entryFeatures = []
+        self.cmdToFeatureType = {}
         self.feature = None
+        self.featureType = None
 
     def onBegin(self,):
         cgen = self.cgen
@@ -110,8 +114,16 @@ class VulkanFuncTable(VulkanWrapperGenerator):
         self.module.appendImpl(cgen.swapCode())
         pass
 
-    def onBeginFeature(self, featureName):
+    def onBeginFeature(self, featureName, featureType):
         self.feature = featureName
+        self.featureType = featureType
+
+    def onEndFeature(self):
+        self.feature = None
+        self.featureType = None
+
+    def onFeatureNewCmd(self, name):
+        self.cmdToFeatureType[name] = self.featureType
 
     def onGenCmd(self, cmdinfo, name, alias):
         typeInfo = self.typeInfo
@@ -167,11 +179,15 @@ class VulkanFuncTable(VulkanWrapperGenerator):
             cgen.beginBlock()
             if self.feature == "VK_VERSION_1_1":
                 cgen.stmt("auto resources = ResourceTracker::get()")
+                if "VkCommandBuffer" == api.parameters[0].typeName:
+                    cgen.stmt("VkDevice device = resources->getDevice(commandBuffer)")
                 cgen.beginIf("resources->getApiVersionFromDevice(device) < VK_API_VERSION_1_1")
                 cgen.stmt("sOnInvalidDynamicallyCheckedCall(\"%s\", \"%s\")" % (api.name, self.feature))
                 cgen.endIf()
             elif self.feature != "VK_VERSION_1_0":
                 cgen.stmt("auto resources = ResourceTracker::get()")
+                if "VkCommandBuffer" == api.parameters[0].typeName:
+                    cgen.stmt("VkDevice device = resources->getDevice(commandBuffer);")
                 cgen.beginIf("!resources->hasDeviceExtension(device, \"%s\")" % self.feature)
                 cgen.stmt("sOnInvalidDynamicallyCheckedCall(\"%s\", \"%s\")" % (api.name, self.feature))
                 cgen.endIf()
@@ -228,6 +244,8 @@ class VulkanFuncTable(VulkanWrapperGenerator):
             "auto resources = ResourceTracker::get()")
         self.cgen.stmt(
             "bool has1_1OrHigher = resources->getApiVersionFromInstance(instance) >= VK_API_VERSION_1_1")
+        self.cgen.stmt(
+            "bool has1_2OrHigher = resources->getApiVersionFromInstance(instance) >= VK_API_VERSION_1_2")
 
         prevFeature = None
         for e, f in zip(self.entries, self.entryFeatures):
@@ -237,7 +255,7 @@ class VulkanFuncTable(VulkanWrapperGenerator):
             if featureEndif:
                 self.cgen.leftline("#endif")
                 self.cgen.leftline("#ifdef %s" % f)
-            
+
             if featureif:
                 self.cgen.leftline("#ifdef %s" % f)
 
@@ -247,6 +265,13 @@ class VulkanFuncTable(VulkanWrapperGenerator):
 
             if e.name in EXCLUDED_APIS:
                 self.cgen.stmt("return nullptr")
+            elif f == "VK_VERSION_1_2":
+                if self.isDeviceDispatch(e):
+                    self.cgen.stmt("return (void*)dynCheck_entry_%s" % e.name)
+                else:
+                    self.cgen.stmt( \
+                        "return has1_2OrHigher ? %s : nullptr" % \
+                        entryPointExpr)
             elif f == "VK_VERSION_1_1":
                 if self.isDeviceDispatch(e):
                     self.cgen.stmt("return (void*)dynCheck_entry_%s" % e.name)
@@ -255,12 +280,19 @@ class VulkanFuncTable(VulkanWrapperGenerator):
                         "return has1_1OrHigher ? %s : nullptr" % \
                         entryPointExpr)
             elif f != "VK_VERSION_1_0":
-                if self.isDeviceDispatch(e):
-                    self.cgen.stmt("return (void*)dynCheck_entry_%s" % e.name)
-                else:
-                    self.cgen.stmt( \
-                        "bool hasExt = resources->hasInstanceExtension(instance, \"%s\")"  % f)
+                entryNeedsInstanceExtensionCheck = self.cmdToFeatureType[e.name] == "instance"
+
+                entryPrefix = "dynCheck_" if self.isDeviceDispatch(e) else ""
+                entryPointExpr = "(void*)%sentry_%s" % (entryPrefix, e.name)
+
+                if entryNeedsInstanceExtensionCheck:
+                    self.cgen.stmt("bool hasExt = resources->hasInstanceExtension(instance, \"%s\")"  % f)
                     self.cgen.stmt("return hasExt ? %s : nullptr" % entryPointExpr)
+                else:
+                    # TODO(b/236246382): We need to check the device extension support here.
+                    self.cgen.stmt("// TODO(b/236246382): Check support for device extension");
+                    self.cgen.stmt("return %s" % entryPointExpr)
+
             else:
                 self.cgen.stmt("return %s" % entryPointExpr)
             self.cgen.endIf()
@@ -290,7 +322,7 @@ class VulkanFuncTable(VulkanWrapperGenerator):
             if featureEndif:
                 self.cgen.leftline("#endif")
                 self.cgen.leftline("#ifdef %s" % f)
-            
+
             if featureif:
                 self.cgen.leftline("#ifdef %s" % f)
 
@@ -321,4 +353,8 @@ class VulkanFuncTable(VulkanWrapperGenerator):
         self.module.appendImpl(self.cgen.swapCode())
 
     def isDeviceDispatch(self, api):
-        return len(api.parameters) > 0 and "VkDevice" == api.parameters[0].typeName
+        # TODO(230793667): improve the heuristic and just use "cmdToFeatureType"
+        return (len(api.parameters) > 0 and
+            "VkDevice" == api.parameters[0].typeName) or (
+            "VkCommandBuffer" == api.parameters[0].typeName and
+            self.cmdToFeatureType.get(api.name, "") == "device")

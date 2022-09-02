@@ -37,8 +37,6 @@ encoder_impl_preamble ="""
 
 using namespace goldfish_vk;
 
-using android::aligned_buf_alloc;
-using android::aligned_buf_free;
 using android::base::guest::AutoLock;
 using android::base::guest::Lock;
 using android::base::BumpPool;
@@ -73,6 +71,8 @@ ENCODER_CUSTOM_RESOURCE_POSTPROCESS = [
     "vkCreateInstance",
     "vkCreateDevice",
     "vkMapMemoryIntoAddressSpaceGOOGLE",
+    "vkGetPhysicalDeviceFeatures2",
+    "vkGetPhysicalDeviceFeatures2KHR",
     "vkGetPhysicalDeviceProperties",
     "vkGetPhysicalDeviceProperties2",
     "vkGetPhysicalDeviceProperties2KHR",
@@ -291,7 +291,7 @@ def emit_parameter_encode_copy_unwrap_count(typeInfo, api, cgen, customUnwrap=No
             # if this is a pointer type and we don't do custom copy nor unwrap,
             # and the transform doesn't end up doing anything,
             # don't deepcopy, just cast it.
-           
+
             avoidDeepcopy = False
 
             if origParam.pointerIndirectionLevels > 0:
@@ -468,7 +468,27 @@ def emit_lock(cgen):
 def emit_unlock(cgen):
     cgen.stmt("if (!queueSubmitWithCommandsEnabled && doLock) this->unlock()")
 
+def emit_debug_log(typeInfo, api, cgen):
+    logFormat = []
+    logVargs = []
+    for param in api.parameters:
+        if param.paramName == "doLock":
+            continue
+
+        paramFormatSpecifier = param.getPrintFormatSpecifier()
+        if not paramFormatSpecifier:
+            continue
+
+        logFormat.append(param.paramName + ":" + paramFormatSpecifier)
+        logVargs.append(param.paramName)
+
+    logFormatStr = ", ".join(logFormat)
+    logVargsStr = ", ".join(logVargs)
+
+    cgen.stmt("ENCODER_DEBUG_LOG(\"%s(%s)\", %s)" % (api.name, logFormatStr, logVargsStr))
+
 def emit_default_encoding(typeInfo, api, cgen):
+    emit_debug_log(typeInfo, api, cgen)
     emit_lock(cgen)
     emit_parameter_encode_preamble_write(typeInfo, api, cgen)
     emit_parameter_encode_copy_unwrap_count(typeInfo, api, cgen)
