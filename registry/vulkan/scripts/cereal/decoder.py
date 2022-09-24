@@ -8,6 +8,7 @@ from .transform import TransformCodegen
 
 from .wrapperdefs import API_PREFIX_MARSHAL
 from .wrapperdefs import API_PREFIX_RESERVEDUNMARSHAL
+from .wrapperdefs import MAX_PACKET_LENGTH
 from .wrapperdefs import VULKAN_STREAM_TYPE
 from .wrapperdefs import ROOT_TYPE_DEFAULT_VALUE
 from .wrapperdefs import RELAXED_APIS
@@ -41,8 +42,9 @@ private:
 """
 
 decoder_impl_preamble ="""
+using android::base::MetricEventBadPacketLength;
+using android::base::MetricEventDuplicateSequenceNum;
 using emugl::vkDispatch;
-using emugl::HealthWatchdog;
 
 using namespace goldfish_vk;
 
@@ -55,7 +57,8 @@ public:
              m_boxedHandleCreateMapping(m_state),
              m_boxedHandleDestroyMapping(m_state),
              m_boxedHandleUnwrapAndDeleteMapping(m_state),
-             m_boxedHandleUnwrapAndDeletePreserveBoxedMapping(m_state) { }
+             m_boxedHandleUnwrapAndDeletePreserveBoxedMapping(m_state),
+             m_prevSeqno(std::nullopt) { }
     %s* stream() { return &m_vkStream; }
     VulkanMemReadingStream* readStream() { return &m_vkMemReadingStream; }
 
@@ -79,6 +82,7 @@ private:
     BoxedHandleUnwrapAndDeleteMapping m_boxedHandleUnwrapAndDeleteMapping;
     android::base::BumpPool m_pool;
     BoxedHandleUnwrapAndDeletePreserveBoxedMapping m_boxedHandleUnwrapAndDeletePreserveBoxedMapping;
+    std::optional<uint32_t> m_prevSeqno;
 };
 
 VkDecoder::VkDecoder() :
@@ -314,7 +318,7 @@ def emit_dispatch_call(api, cgen):
     if delay:
         cgen.line("};")
 
-def emit_global_state_wrapped_call(api, cgen, logger):
+def emit_global_state_wrapped_call(api, cgen, logger, context):
     if api.name in DELAYED_DECODER_DELETES:
         print("Error: Cannot generate a global state wrapped call that is also a delayed delete (yet)");
         raise
@@ -322,6 +326,8 @@ def emit_global_state_wrapped_call(api, cgen, logger):
     customParams = ["&m_pool"] + list(map(lambda p: p.paramName, api.parameters))
     if logger:
         customParams += ["gfx_logger"]
+    if context:
+        customParams += ["context"]
     cgen.vkApiCall(api, customPrefix=global_state_prefix, \
         customParameters=customParams, globalStatePrefix=global_state_prefix, \
         checkForDeviceLost=True)
@@ -454,7 +460,7 @@ def emit_snapshot(typeInfo, api, cgen):
     cgen.vkApiCall(apiForSnapshot, customPrefix="m_state->snapshot()->")
     cgen.endIf()
 
-def emit_decoding(typeInfo, api, cgen, globalWrapped=False, logger=False):
+def emit_decoding(typeInfo, api, cgen, globalWrapped=False, logger=False, context=False):
     isAcquire = api.name in RELAXED_APIS
     emit_decode_parameters(typeInfo, api, cgen, globalWrapped)
 
@@ -462,7 +468,7 @@ def emit_decoding(typeInfo, api, cgen, globalWrapped=False, logger=False):
         emit_seqno_incr(api, cgen)
 
     if globalWrapped:
-        emit_global_state_wrapped_call(api, cgen, logger)
+        emit_global_state_wrapped_call(api, cgen, logger, context)
     else:
         emit_dispatch_call(api, cgen)
 
@@ -484,6 +490,9 @@ def emit_global_state_wrapped_decoding(typeInfo, api, cgen):
 
 def emit_global_state_wrapped_decoding_with_logger(typeInfo, api, cgen):
     emit_decoding(typeInfo, api, cgen, globalWrapped=True, logger=True)
+
+def emit_global_state_wrapped_decoding_with_context(typeInfo, api, cgen):
+    emit_decoding(typeInfo, api, cgen, globalWrapped=True, context=True)
 
 ## Custom decoding definitions##################################################
 def decode_vkFlushMappedMemoryRanges(typeInfo: VulkanTypeInfo, api, cgen):
@@ -692,7 +701,7 @@ custom_decodes = {
     "vkQueueBindSparseAsyncGOOGLE" : emit_global_state_wrapped_decoding,
     "vkGetLinearImageLayoutGOOGLE" : emit_global_state_wrapped_decoding,
     "vkGetLinearImageLayout2GOOGLE" : emit_global_state_wrapped_decoding,
-    "vkQueueFlushCommandsGOOGLE" : emit_global_state_wrapped_decoding_with_logger,
+    "vkQueueFlushCommandsGOOGLE" : emit_global_state_wrapped_decoding_with_context,
     "vkQueueCommitDescriptorSetUpdatesGOOGLE" : emit_global_state_wrapped_decoding,
     "vkCollectDescriptorPoolIdsGOOGLE" : emit_global_state_wrapped_decoding,
     "vkQueueSignalReleaseImageANDROIDAsyncGOOGLE" : emit_global_state_wrapped_decoding,
@@ -718,6 +727,8 @@ class VulkanDecoder(VulkanWrapperGenerator):
         self.cgen = CodeGen()
 
     def onBegin(self,):
+        self.module.appendImpl(
+            "#define MAX_PACKET_LENGTH %s\n" % MAX_PACKET_LENGTH)
         self.module.appendHeader(decoder_decl_preamble)
         self.module.appendImpl(decoder_impl_preamble)
 
@@ -732,6 +743,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
         self.cgen.stmt("const char* processName = context.processName")
         self.cgen.stmt("auto& gfx_logger = *context.gfxApiLogger")
         self.cgen.stmt("auto& healthMonitor = *context.healthMonitor")
+        self.cgen.stmt("auto& metricsLogger = *context.metricsLogger")
         self.cgen.stmt("if (len < 8) return 0")
         self.cgen.stmt("bool queueSubmitWithCommandsEnabled = feature_is_enabled(kFeature_VulkanQueueSubmitWithCommands)")
         self.cgen.stmt("unsigned char *ptr = (unsigned char *)buf")
@@ -746,6 +758,13 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
 
         self.cgen.stmt("uint32_t opcode = *(uint32_t *)ptr")
         self.cgen.stmt("uint32_t packetLen = *(uint32_t *)(ptr + 4)")
+        self.cgen.line("""
+        // packetLen should be at least 8 (op code and packet length) and should not be excessively large
+        if (packetLen < 8 || packetLen > MAX_PACKET_LENGTH) {
+            WARN("Bad packet length %d detected, decode may fail", packetLen);
+            metricsLogger.logMetricEvent(MetricEventBadPacketLength{ .len = packetLen });
+        }
+        """)
         self.cgen.stmt("if (end - ptr < packetLen) return ptr - (unsigned char*)buf")
         self.cgen.stmt("gfx_logger.record(ptr, std::min(size_t(packetLen + 8), size_t(end - ptr)))")
 
@@ -759,31 +778,31 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
         self.cgen.line("""
         if (queueSubmitWithCommandsEnabled && ((opcode >= OP_vkFirst && opcode < OP_vkLast) || (opcode >= OP_vkFirst_old && opcode < OP_vkLast_old))) {
             uint32_t seqno; memcpy(&seqno, *readStreamPtrPtr, sizeof(uint32_t)); *readStreamPtrPtr += sizeof(uint32_t);
+            if (m_prevSeqno  && seqno == m_prevSeqno.value()) {
+                WARN("Seqno %d is the same as previously processed on thread %d. It might be a duplicate command.", seqno, getCurrentThreadId());
+                metricsLogger.logMetricEvent(MetricEventDuplicateSequenceNum{ .opcode = opcode });
+            }
             if (seqnoPtr && !m_forSnapshotLoad) {
                 {
-                    HealthWatchdog watchdog(
-                        healthMonitor,
-                        WATCHDOG_DATA("RenderThread seqno loop - 3 second timeout",
-                                      EventHangMetadata::HangType::kRenderThread, nullptr),
-                        /* Data gathered if this hangs*/
-                        std::function<std::unique_ptr<EventHangMetadata::HangAnnotations>()>([=](){
-                            std::unique_ptr<EventHangMetadata::HangAnnotations> annotations =
-                                std::make_unique<EventHangMetadata::HangAnnotations>();
-                            annotations->insert(
-                                {
-                                    {"seqno", std::to_string(seqno)},
-                                    {"seqnoPtr", std::to_string(__atomic_load_n(seqnoPtr, __ATOMIC_SEQ_CST))},
-                                    {"opcode", std::to_string(opcode)},
-                                    {"buffer_length", std::to_string(len)}
+                    auto watchdog =
+                        WATCHDOG_BUILDER(healthMonitor,
+                                         "RenderThread seqno loop")
+                            .setHangType(EventHangMetadata::HangType::kRenderThread)
+                            /* Data gathered if this hangs*/
+                            .setOnHangCallback([=]() {
+                                auto annotations = std::make_unique<EventHangMetadata::HangAnnotations>();
+                                annotations->insert({{"seqno", std::to_string(seqno)},
+                                                     {"seqnoPtr", std::to_string(__atomic_load_n(
+                                                                      seqnoPtr, __ATOMIC_SEQ_CST))},
+                                                     {"opcode", std::to_string(opcode)},
+                                                     {"buffer_length", std::to_string(len)}});
+                                if (processName) {
+                                    annotations->insert(
+                                        {{"renderthread_guest_process", std::string(processName)}});
                                 }
-                            );
-                            if (processName) {
-                                annotations->insert(
-                                    {{"renderthread_guest_process", std::string(processName)}});
-                            }
-                            return std::move(annotations);
-                        }),
-                        3000 /* 3 seconds. Should be plenty*/);
+                                return std::move(annotations);
+                            })
+                            .build();
                     while ((seqno - __atomic_load_n(seqnoPtr, __ATOMIC_SEQ_CST) != 1)) {
                         #if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))
                         _mm_pause();
@@ -791,6 +810,7 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                         __asm__ __volatile__("pause;");
                         #endif
                     }
+                    m_prevSeqno = seqno;
                 }
             }
         }
