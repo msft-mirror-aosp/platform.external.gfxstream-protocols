@@ -18,9 +18,11 @@ from .wrapperdefs import ROOT_TYPE_DEFAULT_VALUE
 from .wrapperdefs import VULKAN_STREAM_TYPE_GUEST
 
 encoder_decl_preamble = """
+using android::base::guest::HealthMonitor;
+
 class VkEncoder {
 public:
-    VkEncoder(IOStream* stream);
+    VkEncoder(IOStream* stream, HealthMonitor<>* healthMonitor = nullptr);
     ~VkEncoder();
 
 #include "VkEncoder.h.inl"
@@ -30,6 +32,7 @@ encoder_decl_postamble = """
 private:
     class Impl;
     std::unique_ptr<Impl> mImpl;
+    HealthMonitor<>* mHealthMonitor;
 };
 """
 
@@ -364,16 +367,19 @@ def emit_parameter_encode_write_packet_info(typeInfo, api, cgen):
         cgen.stmt("uint32_t packetSize_%s = 4 + 4 + (queueSubmitWithCommandsEnabled ? 4 : 0) + count" % (api.name))
     else:
         cgen.stmt("uint32_t packetSize_%s = 4 + 4 + count" % (api.name))
+    cgen.stmt("healthMonitorAnnotation_packetSize = std::make_optional(packetSize_%s)" % (api.name))
 
     if not doDispatchSerialize:
         cgen.stmt("if (queueSubmitWithCommandsEnabled) packetSize_%s -= 8" % api.name)
 
     cgen.stmt("uint8_t* streamPtr = %s->reserve(packetSize_%s)" % (STREAM, api.name))
+    cgen.stmt("uint8_t* packetBeginPtr = streamPtr")
     cgen.stmt("uint8_t** streamPtrPtr = &streamPtr")
     cgen.stmt("uint32_t opcode_%s = OP_%s" % (api.name, api.name))
 
     if doSeqno:
         cgen.stmt("uint32_t seqno; if (queueSubmitWithCommandsEnabled) seqno = ResourceTracker::nextSeqno()")
+        cgen.stmt("healthMonitorAnnotation_seqno = std::make_optional(seqno)")
 
     cgen.stmt("memcpy(streamPtr, &opcode_%s, sizeof(uint32_t)); streamPtr += sizeof(uint32_t)" % api.name)
     cgen.stmt("memcpy(streamPtr, &packetSize_%s, sizeof(uint32_t)); streamPtr += sizeof(uint32_t)" % api.name)
@@ -395,6 +401,12 @@ def emit_parameter_encode_do_parameter_write(typeInfo, api, cgen):
             emit_marshal(typeInfo, p, cgen)
 
         dispatchDone = True
+    
+    cgen.beginIf("watchdog")
+    cgen.stmt("size_t watchdogBufSize = std::min<size_t>(static_cast<size_t>(packetSize_%s), kWatchdogBufferMax)" % (api.name))
+    cgen.stmt("healthMonitorAnnotation_packetContents.resize(watchdogBufSize)")
+    cgen.stmt("memcpy(&healthMonitorAnnotation_packetContents[0], packetBeginPtr, watchdogBufSize)")
+    cgen.endIf()
 
 def emit_parameter_encode_read(typeInfo, api, cgen):
     encodingParams = EncodingParameters(api)
@@ -486,6 +498,31 @@ def emit_debug_log(typeInfo, api, cgen):
     logVargsStr = ", ".join(logVargs)
 
     cgen.stmt("ENCODER_DEBUG_LOG(\"%s(%s)\", %s)" % (api.name, logFormatStr, logVargsStr))
+
+def emit_health_watchdog(api, cgen):
+    cgen.stmt("std::optional<uint32_t> healthMonitorAnnotation_seqno = std::nullopt")
+    cgen.stmt("std::optional<uint32_t> healthMonitorAnnotation_packetSize = std::nullopt")
+    cgen.stmt("std::vector<uint8_t> healthMonitorAnnotation_packetContents")
+    cgen.line("""
+    auto watchdog = WATCHDOG_BUILDER(mHealthMonitor, \"%s in VkEncoder\")
+                        .setOnHangCallback([&]() {
+                            auto annotations = std::make_unique<EventHangMetadata::HangAnnotations>();
+                            if (healthMonitorAnnotation_seqno) {
+                                annotations->insert({{"seqno", std::to_string(healthMonitorAnnotation_seqno.value())}});
+                            }
+                            if (healthMonitorAnnotation_packetSize) {
+                                annotations->insert({{"packetSize", std::to_string(healthMonitorAnnotation_packetSize.value())}});
+                            }
+                            if (!healthMonitorAnnotation_packetContents.empty()) {
+                                annotations->insert(
+                                    {{"packetContents", getPacketContents(
+                                        &healthMonitorAnnotation_packetContents[0], healthMonitorAnnotation_packetContents.size())}});
+                            }
+                            return std::move(annotations);
+                        })
+                        .build();
+    """% (api.name)
+    )
 
 def emit_default_encoding(typeInfo, api, cgen):
     emit_debug_log(typeInfo, api, cgen)
@@ -669,12 +706,14 @@ class VulkanEncoder(VulkanWrapperGenerator):
 
         self.module.appendHeader(self.cgenHeader.swapCode())
 
-        if api.name in custom_encodes.keys():
-            self.module.appendImpl(self.cgenImpl.makeFuncImpl(
-                apiImpl, lambda cgen: custom_encodes[api.name](self.typeInfo, api, cgen)))
-        else:
-            self.module.appendImpl(self.cgenImpl.makeFuncImpl(apiImpl,
-                lambda cgen: emit_default_encoding(self.typeInfo, api, cgen)))
+        def emit_function_impl(cgen):
+            emit_health_watchdog(api, cgen)
+            if api.name in custom_encodes.keys():
+                custom_encodes[api.name](self.typeInfo, api, cgen)
+            else:
+                emit_default_encoding(self.typeInfo, api, cgen)
+
+        self.module.appendImpl(self.cgenImpl.makeFuncImpl(apiImpl, emit_function_impl))
 
     def onEnd(self,):
         self.module.appendHeader(encoder_decl_postamble)
