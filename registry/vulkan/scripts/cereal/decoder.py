@@ -26,6 +26,7 @@ global_state_prefix = "m_state->on_"
 
 decoder_decl_preamble = """
 
+class ProcessResources;
 class IOStream;
 
 class VkDecoder {
@@ -33,8 +34,8 @@ public:
     VkDecoder();
     ~VkDecoder();
     void setForSnapshotLoad(bool forSnapshotLoad);
-    size_t decode(void* buf, size_t bufsize, IOStream* stream, uint32_t* seqnoPtr,
-                  const VkDecoderContext&);
+    size_t decode(void* buf, size_t bufsize, IOStream* stream,
+                  const ProcessResources* processResources, const VkDecoderContext&);
 private:
     class Impl;
     std::unique_ptr<Impl> mImpl;
@@ -66,8 +67,8 @@ public:
         m_forSnapshotLoad = forSnapshotLoad;
     }
 
-    size_t decode(void* buf, size_t bufsize, IOStream* stream, uint32_t* seqnoPtr,
-                  const VkDecoderContext&);
+    size_t decode(void* buf, size_t bufsize, IOStream* stream,
+                  const ProcessResources* processResources, const VkDecoderContext&);
 
 private:
     bool m_logCalls;
@@ -94,9 +95,10 @@ void VkDecoder::setForSnapshotLoad(bool forSnapshotLoad) {
     mImpl->setForSnapshotLoad(forSnapshotLoad);
 }
 
-size_t VkDecoder::decode(void* buf, size_t bufsize, IOStream* stream, uint32_t* seqnoPtr,
+size_t VkDecoder::decode(void* buf, size_t bufsize, IOStream* stream,
+                         const ProcessResources* processResources,
                          const VkDecoderContext& context) {
-    return mImpl->decode(buf, bufsize, stream, seqnoPtr, context);
+    return mImpl->decode(buf, bufsize, stream, processResources, context);
 }
 
 // VkDecoder::Impl::decode to follow
@@ -423,7 +425,7 @@ def emit_pool_free(cgen):
     cgen.stmt("%s->clearPool()" % READ_STREAM)
 
 def emit_seqno_incr(api, cgen):
-    cgen.stmt("if (queueSubmitWithCommandsEnabled) __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST)")
+    cgen.stmt("if (queueSubmitWithCommandsEnabled) seqnoPtr->fetch_add(1, std::memory_order_seq_cst)")
 
 def emit_snapshot(typeInfo, api, cgen):
 
@@ -613,6 +615,9 @@ custom_decodes = {
     "vkGetImageMemoryRequirements" : emit_global_state_wrapped_decoding,
     "vkGetImageMemoryRequirements2" : emit_global_state_wrapped_decoding,
     "vkGetImageMemoryRequirements2KHR" : emit_global_state_wrapped_decoding,
+    "vkGetBufferMemoryRequirements" : emit_global_state_wrapped_decoding,
+    "vkGetBufferMemoryRequirements2": emit_global_state_wrapped_decoding,
+    "vkGetBufferMemoryRequirements2KHR": emit_global_state_wrapped_decoding,
 
     "vkCreateDescriptorSetLayout" : emit_global_state_wrapped_decoding,
     "vkDestroyDescriptorSetLayout" : emit_global_state_wrapped_decoding,
@@ -741,7 +746,8 @@ class VulkanDecoder(VulkanWrapperGenerator):
 
         self.module.appendImpl(
             """
-size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32_t* seqnoPtr,
+size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                               const ProcessResources* processResources,
                                const VkDecoderContext& context)
 """)
 
@@ -796,6 +802,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 executionData->insert({{"previous_seqno", std::to_string(m_prevSeqno.value())}});
             }
         }
+
+        std::atomic<uint32_t>* seqnoPtr = processResources->getSequenceNumberPtr();
+
         if (queueSubmitWithCommandsEnabled && ((opcode >= OP_vkFirst && opcode < OP_vkLast) || (opcode >= OP_vkFirst_old && opcode < OP_vkLast_old))) {
             uint32_t seqno;
             memcpy(&seqno, *readStreamPtrPtr, sizeof(uint32_t)); *readStreamPtrPtr += sizeof(uint32_t);
@@ -817,12 +826,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                             /* Data gathered if this hangs*/
                             .setOnHangCallback([=]() {
                                 auto annotations = std::make_unique<EventHangMetadata::HangAnnotations>();
-                                annotations->insert({{"seqnoPtr", std::to_string(__atomic_load_n(
-                                                                      seqnoPtr, __ATOMIC_SEQ_CST))}});
+                                annotations->insert({{"seqnoPtr", std::to_string(seqnoPtr->load(std::memory_order_seq_cst))}});
                                 return annotations;
                             })
                             .build();
-                    while ((seqno - __atomic_load_n(seqnoPtr, __ATOMIC_SEQ_CST) != 1)) {
+                    while ((seqno - seqnoPtr->load(std::memory_order_seq_cst) != 1)) {
                         #if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))
                         _mm_pause();
                         #elif (defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)))
