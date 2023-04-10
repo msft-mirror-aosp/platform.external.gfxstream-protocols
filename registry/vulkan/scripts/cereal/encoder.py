@@ -38,7 +38,7 @@ private:
 
 encoder_impl_preamble ="""
 
-using namespace goldfish_vk;
+using namespace gfxstream::vk;
 
 using android::base::guest::AutoLock;
 using android::base::guest::Lock;
@@ -79,9 +79,6 @@ ENCODER_CUSTOM_RESOURCE_POSTPROCESS = [
     "vkGetPhysicalDeviceProperties",
     "vkGetPhysicalDeviceProperties2",
     "vkGetPhysicalDeviceProperties2KHR",
-    "vkGetPhysicalDeviceMemoryProperties",
-    "vkGetPhysicalDeviceMemoryProperties2",
-    "vkGetPhysicalDeviceMemoryProperties2KHR",
     "vkCreateDescriptorUpdateTemplate",
     "vkCreateDescriptorUpdateTemplateKHR",
     "vkGetPhysicalDeviceExternalSemaphoreProperties",
@@ -401,7 +398,7 @@ def emit_parameter_encode_do_parameter_write(typeInfo, api, cgen):
             emit_marshal(typeInfo, p, cgen)
 
         dispatchDone = True
-    
+
     cgen.beginIf("watchdog")
     cgen.stmt("size_t watchdogBufSize = std::min<size_t>(static_cast<size_t>(packetSize_%s), kWatchdogBufferMax)" % (api.name))
     cgen.stmt("healthMonitorAnnotation_packetContents.resize(watchdogBufSize)")
