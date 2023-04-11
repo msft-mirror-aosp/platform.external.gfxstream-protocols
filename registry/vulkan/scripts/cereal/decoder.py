@@ -26,8 +26,13 @@ global_state_prefix = "m_state->on_"
 
 decoder_decl_preamble = """
 
-class ProcessResources;
+namespace gfxstream {
 class IOStream;
+class ProcessResources;
+}  // namespace gfxstream
+
+namespace gfxstream {
+namespace vk {
 
 class VkDecoder {
 public:
@@ -40,14 +45,18 @@ private:
     class Impl;
     std::unique_ptr<Impl> mImpl;
 };
+
+}  // namespace vk
+}  // namespace gfxstream
+
 """
 
 decoder_impl_preamble ="""
+namespace gfxstream {
+namespace vk {
+
 using android::base::MetricEventBadPacketLength;
 using android::base::MetricEventDuplicateSequenceNum;
-using emugl::vkDispatch;
-
-using namespace goldfish_vk;
 
 class VkDecoder::Impl {
 public:
@@ -103,6 +112,13 @@ size_t VkDecoder::decode(void* buf, size_t bufsize, IOStream* stream,
 
 // VkDecoder::Impl::decode to follow
 """ % (VULKAN_STREAM_TYPE, VULKAN_STREAM_TYPE)
+
+decoder_impl_postamble = """
+
+}  // namespace vk
+}  // namespace gfxstream
+
+"""
 
 READ_STREAM = "vkReadStream"
 WRITE_STREAM = "vkStream"
@@ -321,14 +337,12 @@ def emit_dispatch_call(api, cgen):
     if delay:
         cgen.line("};")
 
-def emit_global_state_wrapped_call(api, cgen, logger, context):
+def emit_global_state_wrapped_call(api, cgen, context):
     if api.name in DELAYED_DECODER_DELETES:
         print("Error: Cannot generate a global state wrapped call that is also a delayed delete (yet)");
         raise
 
     customParams = ["&m_pool"] + list(map(lambda p: p.paramName, api.parameters))
-    if logger:
-        customParams += ["gfx_logger"]
     if context:
         customParams += ["context"]
     cgen.vkApiCall(api, customPrefix=global_state_prefix, \
@@ -463,7 +477,7 @@ def emit_snapshot(typeInfo, api, cgen):
     cgen.vkApiCall(apiForSnapshot, customPrefix="m_state->snapshot()->")
     cgen.endIf()
 
-def emit_decoding(typeInfo, api, cgen, globalWrapped=False, logger=False, context=False):
+def emit_decoding(typeInfo, api, cgen, globalWrapped=False, context=False):
     isAcquire = api.name in RELAXED_APIS
     emit_decode_parameters(typeInfo, api, cgen, globalWrapped)
 
@@ -471,7 +485,7 @@ def emit_decoding(typeInfo, api, cgen, globalWrapped=False, logger=False, contex
         emit_seqno_incr(api, cgen)
 
     if globalWrapped:
-        emit_global_state_wrapped_call(api, cgen, logger, context)
+        emit_global_state_wrapped_call(api, cgen, context)
     else:
         emit_dispatch_call(api, cgen)
 
@@ -490,9 +504,6 @@ def emit_default_decoding(typeInfo, api, cgen):
 
 def emit_global_state_wrapped_decoding(typeInfo, api, cgen):
     emit_decoding(typeInfo, api, cgen, globalWrapped=True)
-
-def emit_global_state_wrapped_decoding_with_logger(typeInfo, api, cgen):
-    emit_decoding(typeInfo, api, cgen, globalWrapped=True, logger=True)
 
 def emit_global_state_wrapped_decoding_with_context(typeInfo, api, cgen):
     emit_decoding(typeInfo, api, cgen, globalWrapped=True, context=True)
@@ -647,8 +658,8 @@ custom_decodes = {
     "vkCmdExecuteCommands" : emit_global_state_wrapped_decoding,
     "vkQueueSubmit" : emit_global_state_wrapped_decoding,
     "vkQueueWaitIdle" : emit_global_state_wrapped_decoding,
-    "vkBeginCommandBuffer" : emit_global_state_wrapped_decoding_with_logger,
-    "vkEndCommandBuffer" : emit_global_state_wrapped_decoding_with_logger,
+    "vkBeginCommandBuffer" : emit_global_state_wrapped_decoding_with_context,
+    "vkEndCommandBuffer" : emit_global_state_wrapped_decoding_with_context,
     "vkResetCommandBuffer" : emit_global_state_wrapped_decoding,
     "vkFreeCommandBuffers" : emit_global_state_wrapped_decoding,
     "vkCreateCommandPool" : emit_global_state_wrapped_decoding,
@@ -687,10 +698,7 @@ custom_decodes = {
     "vkFreeMemorySyncGOOGLE" : emit_global_state_wrapped_decoding,
     "vkMapMemoryIntoAddressSpaceGOOGLE" : emit_global_state_wrapped_decoding,
     "vkGetMemoryHostAddressInfoGOOGLE" : emit_global_state_wrapped_decoding,
-
-    # VK_GOOGLE_color_buffer
-    "vkRegisterImageColorBufferGOOGLE" : emit_global_state_wrapped_decoding,
-    "vkRegisterBufferColorBufferGOOGLE" : emit_global_state_wrapped_decoding,
+    "vkGetBlobGOOGLE" : emit_global_state_wrapped_decoding,
 
     # Descriptor update templates
     "vkCreateDescriptorUpdateTemplate" : emit_global_state_wrapped_decoding,
@@ -700,8 +708,8 @@ custom_decodes = {
     "vkUpdateDescriptorSetWithTemplateSizedGOOGLE" : emit_global_state_wrapped_decoding,
 
     # VK_GOOGLE_gfxstream
-    "vkBeginCommandBufferAsyncGOOGLE" : emit_global_state_wrapped_decoding_with_logger,
-    "vkEndCommandBufferAsyncGOOGLE" : emit_global_state_wrapped_decoding_with_logger,
+    "vkBeginCommandBufferAsyncGOOGLE" : emit_global_state_wrapped_decoding_with_context,
+    "vkEndCommandBufferAsyncGOOGLE" : emit_global_state_wrapped_decoding_with_context,
     "vkResetCommandBufferAsyncGOOGLE" : emit_global_state_wrapped_decoding,
     "vkCommandBufferHostSyncGOOGLE" : emit_global_state_wrapped_decoding,
     "vkCreateImageWithRequirementsGOOGLE" : emit_global_state_wrapped_decoding,
@@ -901,3 +909,4 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
         self.cgen.stmt("return ptr - (unsigned char*)buf;")
         self.cgen.endBlock() # function body
         self.module.appendImpl(self.cgen.swapCode())
+        self.module.appendImpl(decoder_impl_postamble)
