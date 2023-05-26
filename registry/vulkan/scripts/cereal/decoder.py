@@ -26,27 +26,37 @@ global_state_prefix = "m_state->on_"
 
 decoder_decl_preamble = """
 
+namespace gfxstream {
 class IOStream;
+class ProcessResources;
+}  // namespace gfxstream
+
+namespace gfxstream {
+namespace vk {
 
 class VkDecoder {
 public:
     VkDecoder();
     ~VkDecoder();
     void setForSnapshotLoad(bool forSnapshotLoad);
-    size_t decode(void* buf, size_t bufsize, IOStream* stream, uint32_t* seqnoPtr,
-                  const VkDecoderContext&);
+    size_t decode(void* buf, size_t bufsize, IOStream* stream,
+                  const ProcessResources* processResources, const VkDecoderContext&);
 private:
     class Impl;
     std::unique_ptr<Impl> mImpl;
 };
+
+}  // namespace vk
+}  // namespace gfxstream
+
 """
 
 decoder_impl_preamble ="""
+namespace gfxstream {
+namespace vk {
+
 using android::base::MetricEventBadPacketLength;
 using android::base::MetricEventDuplicateSequenceNum;
-using emugl::vkDispatch;
-
-using namespace goldfish_vk;
 
 class VkDecoder::Impl {
 public:
@@ -66,8 +76,8 @@ public:
         m_forSnapshotLoad = forSnapshotLoad;
     }
 
-    size_t decode(void* buf, size_t bufsize, IOStream* stream, uint32_t* seqnoPtr,
-                  const VkDecoderContext&);
+    size_t decode(void* buf, size_t bufsize, IOStream* stream,
+                  const ProcessResources* processResources, const VkDecoderContext&);
 
 private:
     bool m_logCalls;
@@ -94,13 +104,21 @@ void VkDecoder::setForSnapshotLoad(bool forSnapshotLoad) {
     mImpl->setForSnapshotLoad(forSnapshotLoad);
 }
 
-size_t VkDecoder::decode(void* buf, size_t bufsize, IOStream* stream, uint32_t* seqnoPtr,
+size_t VkDecoder::decode(void* buf, size_t bufsize, IOStream* stream,
+                         const ProcessResources* processResources,
                          const VkDecoderContext& context) {
-    return mImpl->decode(buf, bufsize, stream, seqnoPtr, context);
+    return mImpl->decode(buf, bufsize, stream, processResources, context);
 }
 
 // VkDecoder::Impl::decode to follow
 """ % (VULKAN_STREAM_TYPE, VULKAN_STREAM_TYPE)
+
+decoder_impl_postamble = """
+
+}  // namespace vk
+}  // namespace gfxstream
+
+"""
 
 READ_STREAM = "vkReadStream"
 WRITE_STREAM = "vkStream"
@@ -319,14 +337,12 @@ def emit_dispatch_call(api, cgen):
     if delay:
         cgen.line("};")
 
-def emit_global_state_wrapped_call(api, cgen, logger, context):
+def emit_global_state_wrapped_call(api, cgen, context):
     if api.name in DELAYED_DECODER_DELETES:
         print("Error: Cannot generate a global state wrapped call that is also a delayed delete (yet)");
         raise
 
     customParams = ["&m_pool"] + list(map(lambda p: p.paramName, api.parameters))
-    if logger:
-        customParams += ["gfx_logger"]
     if context:
         customParams += ["context"]
     cgen.vkApiCall(api, customPrefix=global_state_prefix, \
@@ -423,7 +439,7 @@ def emit_pool_free(cgen):
     cgen.stmt("%s->clearPool()" % READ_STREAM)
 
 def emit_seqno_incr(api, cgen):
-    cgen.stmt("if (queueSubmitWithCommandsEnabled) __atomic_fetch_add(seqnoPtr, 1, __ATOMIC_SEQ_CST)")
+    cgen.stmt("if (queueSubmitWithCommandsEnabled) seqnoPtr->fetch_add(1, std::memory_order_seq_cst)")
 
 def emit_snapshot(typeInfo, api, cgen):
 
@@ -461,7 +477,7 @@ def emit_snapshot(typeInfo, api, cgen):
     cgen.vkApiCall(apiForSnapshot, customPrefix="m_state->snapshot()->")
     cgen.endIf()
 
-def emit_decoding(typeInfo, api, cgen, globalWrapped=False, logger=False, context=False):
+def emit_decoding(typeInfo, api, cgen, globalWrapped=False, context=False):
     isAcquire = api.name in RELAXED_APIS
     emit_decode_parameters(typeInfo, api, cgen, globalWrapped)
 
@@ -469,7 +485,7 @@ def emit_decoding(typeInfo, api, cgen, globalWrapped=False, logger=False, contex
         emit_seqno_incr(api, cgen)
 
     if globalWrapped:
-        emit_global_state_wrapped_call(api, cgen, logger, context)
+        emit_global_state_wrapped_call(api, cgen, context)
     else:
         emit_dispatch_call(api, cgen)
 
@@ -488,9 +504,6 @@ def emit_default_decoding(typeInfo, api, cgen):
 
 def emit_global_state_wrapped_decoding(typeInfo, api, cgen):
     emit_decoding(typeInfo, api, cgen, globalWrapped=True)
-
-def emit_global_state_wrapped_decoding_with_logger(typeInfo, api, cgen):
-    emit_decoding(typeInfo, api, cgen, globalWrapped=True, logger=True)
 
 def emit_global_state_wrapped_decoding_with_context(typeInfo, api, cgen):
     emit_decoding(typeInfo, api, cgen, globalWrapped=True, context=True)
@@ -613,6 +626,9 @@ custom_decodes = {
     "vkGetImageMemoryRequirements" : emit_global_state_wrapped_decoding,
     "vkGetImageMemoryRequirements2" : emit_global_state_wrapped_decoding,
     "vkGetImageMemoryRequirements2KHR" : emit_global_state_wrapped_decoding,
+    "vkGetBufferMemoryRequirements" : emit_global_state_wrapped_decoding,
+    "vkGetBufferMemoryRequirements2": emit_global_state_wrapped_decoding,
+    "vkGetBufferMemoryRequirements2KHR": emit_global_state_wrapped_decoding,
 
     "vkCreateDescriptorSetLayout" : emit_global_state_wrapped_decoding,
     "vkDestroyDescriptorSetLayout" : emit_global_state_wrapped_decoding,
@@ -642,8 +658,8 @@ custom_decodes = {
     "vkCmdExecuteCommands" : emit_global_state_wrapped_decoding,
     "vkQueueSubmit" : emit_global_state_wrapped_decoding,
     "vkQueueWaitIdle" : emit_global_state_wrapped_decoding,
-    "vkBeginCommandBuffer" : emit_global_state_wrapped_decoding_with_logger,
-    "vkEndCommandBuffer" : emit_global_state_wrapped_decoding_with_logger,
+    "vkBeginCommandBuffer" : emit_global_state_wrapped_decoding_with_context,
+    "vkEndCommandBuffer" : emit_global_state_wrapped_decoding_with_context,
     "vkResetCommandBuffer" : emit_global_state_wrapped_decoding,
     "vkFreeCommandBuffers" : emit_global_state_wrapped_decoding,
     "vkCreateCommandPool" : emit_global_state_wrapped_decoding,
@@ -682,10 +698,7 @@ custom_decodes = {
     "vkFreeMemorySyncGOOGLE" : emit_global_state_wrapped_decoding,
     "vkMapMemoryIntoAddressSpaceGOOGLE" : emit_global_state_wrapped_decoding,
     "vkGetMemoryHostAddressInfoGOOGLE" : emit_global_state_wrapped_decoding,
-
-    # VK_GOOGLE_color_buffer
-    "vkRegisterImageColorBufferGOOGLE" : emit_global_state_wrapped_decoding,
-    "vkRegisterBufferColorBufferGOOGLE" : emit_global_state_wrapped_decoding,
+    "vkGetBlobGOOGLE" : emit_global_state_wrapped_decoding,
 
     # Descriptor update templates
     "vkCreateDescriptorUpdateTemplate" : emit_global_state_wrapped_decoding,
@@ -695,8 +708,8 @@ custom_decodes = {
     "vkUpdateDescriptorSetWithTemplateSizedGOOGLE" : emit_global_state_wrapped_decoding,
 
     # VK_GOOGLE_gfxstream
-    "vkBeginCommandBufferAsyncGOOGLE" : emit_global_state_wrapped_decoding_with_logger,
-    "vkEndCommandBufferAsyncGOOGLE" : emit_global_state_wrapped_decoding_with_logger,
+    "vkBeginCommandBufferAsyncGOOGLE" : emit_global_state_wrapped_decoding_with_context,
+    "vkEndCommandBufferAsyncGOOGLE" : emit_global_state_wrapped_decoding_with_context,
     "vkResetCommandBufferAsyncGOOGLE" : emit_global_state_wrapped_decoding,
     "vkCommandBufferHostSyncGOOGLE" : emit_global_state_wrapped_decoding,
     "vkCreateImageWithRequirementsGOOGLE" : emit_global_state_wrapped_decoding,
@@ -741,7 +754,8 @@ class VulkanDecoder(VulkanWrapperGenerator):
 
         self.module.appendImpl(
             """
-size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32_t* seqnoPtr,
+size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                               const ProcessResources* processResources,
                                const VkDecoderContext& context)
 """)
 
@@ -796,6 +810,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                 executionData->insert({{"previous_seqno", std::to_string(m_prevSeqno.value())}});
             }
         }
+
+        std::atomic<uint32_t>* seqnoPtr = processResources->getSequenceNumberPtr();
+
         if (queueSubmitWithCommandsEnabled && ((opcode >= OP_vkFirst && opcode < OP_vkLast) || (opcode >= OP_vkFirst_old && opcode < OP_vkLast_old))) {
             uint32_t seqno;
             memcpy(&seqno, *readStreamPtrPtr, sizeof(uint32_t)); *readStreamPtrPtr += sizeof(uint32_t);
@@ -817,12 +834,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
                             /* Data gathered if this hangs*/
                             .setOnHangCallback([=]() {
                                 auto annotations = std::make_unique<EventHangMetadata::HangAnnotations>();
-                                annotations->insert({{"seqnoPtr", std::to_string(__atomic_load_n(
-                                                                      seqnoPtr, __ATOMIC_SEQ_CST))}});
+                                annotations->insert({{"seqnoPtr", std::to_string(seqnoPtr->load(std::memory_order_seq_cst))}});
                                 return annotations;
                             })
                             .build();
-                    while ((seqno - __atomic_load_n(seqnoPtr, __ATOMIC_SEQ_CST) != 1)) {
+                    while ((seqno - seqnoPtr->load(std::memory_order_seq_cst) != 1)) {
                         #if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))
                         _mm_pause();
                         #elif (defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)))
@@ -893,3 +909,4 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream, uint32
         self.cgen.stmt("return ptr - (unsigned char*)buf;")
         self.cgen.endBlock() # function body
         self.module.appendImpl(self.cgen.swapCode())
+        self.module.appendImpl(decoder_impl_postamble)
