@@ -26,11 +26,11 @@ then
     AOSP_DIR=$(pwd)/../..
     export GOLDFISH_OPENGL_DIR=$AOSP_DIR/device/generic/goldfish-opengl
     export VULKAN_CEREAL_DIR=$AOSP_DIR/device/generic/vulkan-cereal
-    export VULKAN_REGISTRY_DIR=$AOSP_DIR/external/gfxstream-protocols/registry/vulkan
+    export VULKAN_REGISTRY_DIR=$AOSP_DIR/external/gfxstream-protocols/codegen/vulkan
 else
     export GOLDFISH_OPENGL_DIR=$1
     export VULKAN_CEREAL_DIR=$2
-    export VULKAN_REGISTRY_DIR=registry/vulkan
+    export VULKAN_REGISTRY_DIR=codegen/vulkan
 fi
 
 # Detect clang-format
@@ -40,7 +40,7 @@ if ! $WHICH clang-format > /dev/null; then
 fi
 
 # Generate Vulkan headers
-VULKAN_HEADERS_ROOT=$PROJECT_ROOT/include/vulkan
+VULKAN_HEADERS_ROOT=$PROJECT_ROOT/common/vulkan
 rm -rf $VULKAN_HEADERS_ROOT && mkdir -p $VULKAN_HEADERS_ROOT
 if [ $? -ne 0 ]; then
     echo "Failed to clear the old Vulkan headers." 1>&2
@@ -57,8 +57,8 @@ cd $PROJECT_ROOT
 
 export VK_CEREAL_GUEST_ENCODER_DIR=$GOLDFISH_OPENGL_DIR/system/vulkan_enc
 export VK_CEREAL_GUEST_HAL_DIR=$GOLDFISH_OPENGL_DIR/system/vulkan
-export VK_CEREAL_HOST_DECODER_DIR=$VULKAN_CEREAL_DIR/stream-servers/vulkan
-export VK_CEREAL_HOST_INCLUDE_DIR=$VULKAN_CEREAL_DIR/stream-servers
+export VK_CEREAL_HOST_DECODER_DIR=$VULKAN_CEREAL_DIR/host/vulkan
+export VK_CEREAL_HOST_INCLUDE_DIR=$VULKAN_CEREAL_DIR/host
 export VK_CEREAL_HOST_SCRIPTS_DIR=$VULKAN_CEREAL_DIR/scripts
 export VK_CEREAL_BASELIB_PREFIX=aemu/base
 export VK_CEREAL_BASELIB_LINKNAME=aemu-base.headers
